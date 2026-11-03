@@ -237,9 +237,16 @@ jobs:
             exit 1
           fi
 
-          find "$APP" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-          find "$APP" -name '*.pyc' -delete 2>/dev/null || true
-          codesign --verify --deep --strict "$APP"
+          # Verify the bundle exactly as electron-builder signed it. Interpreter caches that
+          # shipped inside the runtime are part of the seal and must stay; only caches written
+          # after signing (which invalidate it) are removed, and only when the seal is broken.
+          if ! codesign --verify --deep --strict "$APP" 2>/tmp/codesign.err; then
+            echo "::warning::the bundle does not verify as built; retrying after removing interpreter caches"
+            cat /tmp/codesign.err || true
+            find "$APP" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+            find "$APP" -name '*.pyc' -delete 2>/dev/null || true
+            codesign --verify --deep --strict "$APP"
+          fi
           codesign -dv --verbose=4 "$APP" 2>&1 | grep -E '^(Identifier|Format|Signature|TeamIdentifier)' || true
 
           "$APP/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" \
