@@ -321,7 +321,7 @@ jobs:
 
           REL_TAG="dsh-v$VERSION"
           printf '%s\n' \
-            "由上游标签 `$SOURCE_TAG` 构建（$LINE_NAME 线）的桌面端安装包。" \
+            "由上游标签 $SOURCE_TAG 构建（$LINE_NAME 线）的桌面端安装包。" \
             "" \
             "| 平台 | 文件 |" \
             "|---|---|" \
@@ -337,14 +337,14 @@ jobs:
             "" \
             "SHA-256 见附件 SHA256SUMS.txt。" > /tmp/notes.md
 
-          if gh release view "$REL_TAG" >/dev/null 2>&1; then
-            gh release edit "$REL_TAG" --title "DeepSeek Harness desktop $VERSION" --notes-file /tmp/notes.md
+          if gh release view "$REL_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$REL_TAG" -R "$GITHUB_REPOSITORY" --title "DeepSeek Harness desktop $VERSION" --notes-file /tmp/notes.md
           else
-            gh release create "$REL_TAG" --title "DeepSeek Harness desktop $VERSION" \
+            gh release create "$REL_TAG" -R "$GITHUB_REPOSITORY" --title "DeepSeek Harness desktop $VERSION" \
               --notes-file /tmp/notes.md --prerelease
           fi
-          gh release upload "$REL_TAG" dist/* --clobber
-          echo "release: $(gh release view "$REL_TAG" --json url --jq .url)"
+          gh release upload "$REL_TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber
+          echo "release: $(gh release view "$REL_TAG" -R "$GITHUB_REPOSITORY" --json url --jq .url)"
 
   notify:
     name: Notify Feishu
