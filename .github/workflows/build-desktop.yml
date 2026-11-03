@@ -185,6 +185,12 @@ jobs:
       - name: Package ${{ matrix.target }}
         timeout-minutes: 180
         run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # GNU tar (Git for Windows) reads the "D:" drive letter of an absolute path as a
+            # remote host; the bsdtar that ships with Windows does not.
+            export PATH="/c/Windows/System32:$PATH"
+            tar --version | head -1
+          fi
           for ATTEMPT in 1 2; do
             echo "::group::packaging attempt $ATTEMPT"
             if pnpm run ${{ matrix.script }}; then
