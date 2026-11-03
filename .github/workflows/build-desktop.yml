@@ -169,6 +169,19 @@ jobs:
         timeout-minutes: 60
         run: pnpm install --frozen-lockfile
 
+      - name: Write apps/desktop/.env.windows (Windows only)
+        if: ${{ matrix.target == 'win-x64' }}
+        run: |
+          # Unlike the macOS unsigned path, the Windows one still reads its dotenv file.
+          # These are placeholders that never resolve, so updates fail closed.
+          cat > apps/desktop/.env.windows <<'EOF'
+          DSH_DESKTOP_APP_ID=com.deepseek.harness
+          DSH_DESKTOP_AUTO_UPDATE_ENV=test
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://update.example.invalid
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{"allowedAuthOrigins":["https://login.example.invalid"]}'
+          EOF
+          cat apps/desktop/.env.windows
+
       - name: Package ${{ matrix.target }}
         timeout-minutes: 180
         run: |
