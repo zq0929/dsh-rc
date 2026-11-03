@@ -1,0 +1,359 @@
+# Build the DeepSeek Harness desktop packages for one release line.
+#
+# The line comes from the repository variable LINE, so this single file serves both
+# repositories: LINE=alpha follows the newest dsh-v*-alpha.* tag, LINE=rc the newest
+# dsh-v*-rc.* tag. Each run snapshots that tag's tree and builds three targets:
+#
+#   mac x64    macos-15-intel
+#   mac arm64  macos-15        (Apple Silicon)
+#   win x64    windows-2025
+#
+# Every target uses upstream's own unsigned path: ad-hoc macOS signing, no certificate,
+# no notarization, no release credentials. GitHub disables scheduled workflows in forks,
+# and this repository is an ordinary repository, so the schedule works here.
+
+name: Build desktop packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when the line already points at the newest tag
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 18 * * *'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
+  DSH_TELEMETRY_DISABLED: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+  LINE: ${{ vars.LINE || 'alpha' }}
+
+concurrency:
+  group: build-desktop
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Resolve the newest tag and snapshot its tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      version: ${{ steps.sync.outputs.version }}
+      tag: ${{ steps.sync.outputs.tag }}
+      head: ${{ steps.sync.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+
+      - name: Replace the tree with the tag snapshot
+        id: sync
+        run: |
+          set -euo pipefail
+          UPSTREAM="https://github.com/$UPSTREAM_REPOSITORY"
+          TAG=$(git ls-remote --tags "$UPSTREAM" "refs/tags/dsh-v*-$LINE.*" \
+                  | sed 's#.*refs/tags/##' | grep -v '\^{}' | sort -V | tail -1)
+          if [ -z "$TAG" ]; then
+            echo "::error::no upstream tag matches dsh-v*-$LINE.*"
+            exit 1
+          fi
+          echo "newest $LINE tag: $TAG"
+          SHA=$(git ls-remote "$UPSTREAM" "refs/tags/$TAG^{}" | cut -f1)
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote "$UPSTREAM" "refs/tags/$TAG" | cut -f1)
+          fi
+          echo "tag commit: $SHA"
+
+          curl -sSL --retry 3 --max-time 900 \
+            "https://codeload.github.com/$UPSTREAM_REPOSITORY/tar.gz/$TAG" -o /tmp/tag.tar.gz
+          rm -rf /tmp/tag && mkdir -p /tmp/tag
+          tar -xzf /tmp/tag.tar.gz -C /tmp/tag --strip-components=1
+          VERSION=$(node -p "require('/tmp/tag/apps/desktop/package.json').version")
+          echo "version: $VERSION"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+          RECORDED=$(cat .dsh-upstream-tag 2>/dev/null || true)
+          if [ "$TAG" = "$RECORDED" ]; then
+            echo "already built $TAG; nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          rsync -a --delete --exclude '.git' --exclude '.github' /tmp/tag/ ./
+          printf '%s\n' "$TAG" > .dsh-upstream-tag
+          printf '%s\n' "$SHA" > .dsh-upstream-sha
+          printf '%s\n' "$VERSION" > .dsh-version
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Snapshot $TAG ($VERSION)"
+          git push origin HEAD:master
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.label }}
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || inputs.force }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Intel (x86_64)
+            runs-on: macos-15-intel
+            target: mac-x64
+            arch: x86_64
+            format: macos-x64
+            script: package:desktop:mac:x64:unsigned
+          - label: macOS Apple Silicon (arm64)
+            runs-on: macos-15
+            target: mac-arm64
+            arch: arm64
+            format: macos-arm64
+            script: package:desktop:mac:arm64:unsigned
+          - label: Windows x64
+            runs-on: windows-2025
+            target: win-x64
+            arch: x86_64
+            format: windows-x64
+            script: package:desktop:win:x64:unsigned
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+
+      - name: Refresh to the snapshot the sync job produced
+        run: |
+          git fetch --depth 1 origin master
+          git checkout --detach FETCH_HEAD
+          echo "building $(cat .dsh-upstream-tag) = $(cat .dsh-version) for ${{ matrix.target }}"
+          if [ "$(git rev-parse HEAD)" != "${{ needs.sync.outputs.head }}" ]; then
+            echo "::warning::checked out a different commit than the sync job reported"
+          fi
+
+      - name: Report runner
+        run: |
+          node --version
+          df -h . || true
+
+      - name: Free disk space (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          rm -rf ~/Library/Caches/Homebrew ~/Library/Developer/Xcode/DerivedData 2>/dev/null || true
+          df -h /
+
+      - uses: pnpm/action-setup@v5.0.0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install workspace dependencies
+        timeout-minutes: 60
+        run: pnpm install --frozen-lockfile
+
+      - name: Package ${{ matrix.target }}
+        timeout-minutes: 180
+        run: |
+          for ATTEMPT in 1 2; do
+            echo "::group::packaging attempt $ATTEMPT"
+            if pnpm run ${{ matrix.script }}; then
+              echo "::endgroup::"
+              echo "packaging succeeded on attempt $ATTEMPT"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::packaging attempt $ATTEMPT failed"
+            sleep 10
+          done
+          echo "::error::packaging failed on both attempts"
+          exit 1
+
+      - name: Verify and stage ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          VERSION=$(cat .dsh-version)
+          TARGET="${{ matrix.target }}"
+          FORMAT="${{ matrix.format }}"
+          ARCH="${{ matrix.arch }}"
+          OUT="apps/desktop/.desktop-build/targets/$TARGET/unsigned-artifacts"
+          mkdir -p dist
+
+          if [ "$TARGET" = "win-x64" ]; then
+            set +e
+            EXE=$(ls "$OUT"/*.exe 2>/dev/null | head -1)
+            set -e
+            if [ -z "$EXE" ]; then
+              echo "::error::no Windows installer was produced"
+              exit 1
+            fi
+            ls -lh "$EXE"
+            cp "$EXE" "dist/deepseek-harness-$VERSION-$FORMAT-unsigned.exe"
+            ls -lh dist
+            exit 0
+          fi
+
+          APP="$OUT/mac/DeepSeek Harness.app"
+          if [ "$TARGET" = "mac-arm64" ]; then
+            APP="$OUT/mac-arm64/DeepSeek Harness.app"
+          fi
+          if [ ! -d "$APP" ]; then
+            echo "::error::no application bundle at $APP"
+            exit 1
+          fi
+
+          if ! file "$APP/Contents/MacOS/DeepSeek Harness" | grep -q "$ARCH"; then
+            echo "::error::main binary is not $ARCH"
+            exit 1
+          fi
+
+          find "$APP" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$APP" -name '*.pyc' -delete 2>/dev/null || true
+          codesign --verify --deep --strict "$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E '^(Identifier|Format|Signature|TeamIdentifier)' || true
+
+          "$APP/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" \
+            -e "console.log('bundled node', process.version, process.arch)"
+          "$APP/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3" \
+            -c "import sys; print('bundled python', sys.version.split()[0])"
+
+          if xattr -p com.apple.quarantine "$APP" >/dev/null 2>&1; then
+            echo "::error::the built app carries a quarantine attribute"
+            exit 1
+          fi
+
+          DMG=$(ls "$OUT"/*.dmg | head -1)
+          if [ -z "$DMG" ]; then
+            echo "::error::no dmg was produced"
+            exit 1
+          fi
+          cp "$DMG" "dist/deepseek-harness-$VERSION-$FORMAT.dmg"
+          ditto -c -k --keepParent "$APP" "dist/deepseek-harness-$VERSION-$FORMAT.zip"
+
+          MP=$(hdiutil attach -nobrowse -readonly "dist/deepseek-harness-$VERSION-$FORMAT.dmg" \
+                 | awk -F'\t' '/\/Volumes\//{print $NF; exit}')
+          if [ -z "$MP" ]; then
+            echo "::error::the dmg did not mount"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$MP/DeepSeek Harness.app"
+          hdiutil detach "$MP" >/dev/null
+
+          CHECK=$(mktemp -d)
+          ditto -x -k "dist/deepseek-harness-$VERSION-$FORMAT.zip" "$CHECK"
+          codesign --verify --deep --strict "$CHECK/DeepSeek Harness.app"
+          rm -rf "$CHECK"
+          echo "dmg and zip both verify after extraction"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pkg-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the release
+    needs: [sync, build]
+    if: ${{ needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          SOURCE_TAG: ${{ needs.sync.outputs.tag }}
+          LINE_NAME: ${{ env.LINE }}
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          ( cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+          REL_TAG="dsh-v$VERSION"
+          printf '%s\n' \
+            "由上游标签 `$SOURCE_TAG` 构建（$LINE_NAME 线）的桌面端安装包。" \
+            "" \
+            "| 平台 | 文件 |" \
+            "|---|---|" \
+            "| macOS Intel (x86_64) | deepseek-harness-$VERSION-macos-x64.dmg / .zip |" \
+            "| macOS Apple Silicon (arm64) | deepseek-harness-$VERSION-macos-arm64.dmg / .zip |" \
+            "| Windows x64 | deepseek-harness-$VERSION-windows-x64-unsigned.exe |" \
+            "" \
+            "**macOS 首次打开**：浏览器下载会带 quarantine 标记，执行一次：" \
+            "" \
+            "    xattr -dr com.apple.quarantine \"/Applications/DeepSeek Harness.app\"" \
+            "" \
+            "**Windows**：exe 直接安装，未签名，SmartScreen 选“仍要运行”。" \
+            "" \
+            "SHA-256 见附件 SHA256SUMS.txt。" > /tmp/notes.md
+
+          if gh release view "$REL_TAG" >/dev/null 2>&1; then
+            gh release edit "$REL_TAG" --title "DeepSeek Harness desktop $VERSION" --notes-file /tmp/notes.md
+          else
+            gh release create "$REL_TAG" --title "DeepSeek Harness desktop $VERSION" \
+              --notes-file /tmp/notes.md --prerelease
+          fi
+          gh release upload "$REL_TAG" dist/* --clobber
+          echo "release: $(gh release view "$REL_TAG" --json url --jq .url)"
+
+  notify:
+    name: Notify Feishu
+    needs: [sync, build, release]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Send the result to the Feishu bot
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          LINE_NAME: ${{ env.LINE }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          SOURCE_TAG: ${{ needs.sync.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$FEISHU_WEBHOOK" ]; then
+            echo "::warning::FEISHU_WEBHOOK is not set; skipping the notification"
+            exit 0
+          fi
+          STAMP=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M")
+          if [ "$SYNC_RESULT" != "success" ]; then
+            TEXT=$(printf "%s\n" "❌ DeepSeek Harness [$LINE_NAME]：同步上游失败" "日志：$RUN_URL")
+          elif [ "$BUILD_RESULT" = "skipped" ]; then
+            TEXT=$(printf "%s\n" "✅ DeepSeek Harness [$LINE_NAME]：已是最新 tag，未构建" "标签：$SOURCE_TAG" "时间：$STAMP")
+          elif [ "$RELEASE_RESULT" = "success" ]; then
+            TEXT=$(printf "%s\n" "🚀 DeepSeek Harness [$LINE_NAME] 三平台已发布" "版本：$VERSION（$SOURCE_TAG）" "Release：https://github.com/$GITHUB_REPOSITORY/releases/tag/dsh-v$VERSION" "时间：$STAMP")
+          else
+            TEXT=$(printf "%s\n" "❌ DeepSeek Harness [$LINE_NAME]：构建或发布失败" "版本：$VERSION（$SOURCE_TAG）" "日志：$RUN_URL" "时间：$STAMP")
+          fi
+          PAYLOAD=$(jq -n --arg text "$TEXT" '{msg_type:"text",content:{text:$text}}')
+          RESPONSE=$(curl -sS --max-time 20 -X POST "$FEISHU_WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1) || true
+          echo "feishu response: $RESPONSE"
+          printf "%s" "$RESPONSE" | jq -e ".code == 0 or .StatusCode == 0" >/dev/null \
+            || echo "::warning::the Feishu bot did not accept the message"
